@@ -1,0 +1,20 @@
+[project]
+name = "comfyui-tensortrap"
+version = "0.1.0"
+description = "Security scanner for ComfyUI workflows, custom nodes, and model files"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "realmarauder", email = "smichael.us@gmail.com"}
+]
+keywords = ["security", "comfyui", "ai", "ml", "scanner", "malware", "custom-nodes", "workflow"]
+dependencies = [
+    "tensortrap>=1.2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/realmarauder/ComfyUI-TensorTrap"
+Repository = "https://github.com/realmarauder/ComfyUI-TensorTrap"
+Issues = "https://github.com/realmarauder/ComfyUI-TensorTrap/issues"
+TensorTrap = "https://github.com/realmarauder/TensorTrap"

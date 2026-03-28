@@ -1,0 +1,166 @@
+"""TensorTrap security nodes for ComfyUI workflows.
+
+Provides nodes that can be added to workflows to scan models
+before they're loaded and analyze workflow security.
+"""
+
+import json
+from pathlib import Path
+
+
+class TensorTrapScanModel:
+    """Scans a model file for security threats before loading.
+
+    Drop this node before any model loader to verify the file
+    is safe before it enters your workflow.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_path": ("STRING", {"default": "", "multiline": False}),
+            },
+            "optional": {
+                "block_on_threat": ("BOOLEAN", {"default": True}),
+                "min_severity": (["CRITICAL", "HIGH", "MEDIUM", "LOW"], {"default": "HIGH"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "BOOLEAN")
+    RETURN_NAMES = ("model_path", "scan_report", "is_safe")
+    FUNCTION = "scan"
+    CATEGORY = "TensorTrap/Security"
+
+    def scan(self, model_path, block_on_threat=True, min_severity="HIGH"):
+        scan_report = ""
+        is_safe = True
+
+        filepath = Path(model_path).expanduser()
+
+        if not filepath.exists():
+            return (model_path, f"File not found: {model_path}", False)
+
+        try:
+            from tensortrap.scanner.engine import scan_file
+
+            result = scan_file(filepath, compute_hash=False)
+            is_safe = result.is_safe
+            scan_report = json.dumps(result.to_dict(), indent=2)
+
+            if not is_safe and block_on_threat:
+                severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+                threshold = severity_order.get(min_severity, 1)
+                max_sev = result.max_severity
+                if max_sev and severity_order.get(max_sev.value, 4) <= threshold:
+                    raise Exception(
+                        f"TensorTrap blocked model load: {filepath.name} has "
+                        f"{max_sev.value.upper()} severity findings. "
+                        f"Run 'tensortrap scan {filepath}' for details."
+                    )
+
+        except ImportError:
+            scan_report = "TensorTrap not installed. Run: pip install tensortrap"
+
+        return (model_path, scan_report, is_safe)
+
+
+class TensorTrapAuditNodes:
+    """Scans all installed custom nodes for dangerous code patterns.
+
+    Run this periodically to check if any installed nodes
+    contain eval(), exec(), subprocess, or other dangerous patterns.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "optional": {
+                "trigger": ("*",),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "INT", "INT")
+    RETURN_NAMES = ("audit_report", "total_packages", "packages_with_issues")
+    FUNCTION = "audit"
+    CATEGORY = "TensorTrap/Security"
+
+    def audit(self, trigger=None):
+        from auditor.node_scanner import scan_all_nodes
+
+        # Find custom_nodes directory
+        custom_nodes_dir = Path(__file__).parent.parent.parent
+        if not (custom_nodes_dir / "ComfyUI-TensorTrap").exists():
+            # Try alternate path
+            custom_nodes_dir = Path("custom_nodes")
+
+        results = scan_all_nodes(custom_nodes_dir)
+        total = len(results)
+        with_issues = sum(1 for r in results if not r.is_safe)
+
+        report_lines = [f"TensorTrap Node Audit: {total} packages scanned\n"]
+        report_lines.append(f"Packages with issues: {with_issues}\n\n")
+
+        for r in sorted(results, key=lambda x: x.is_safe):
+            if not r.is_safe:
+                report_lines.append(f"[{r.max_severity}] {r.package_name}")
+                report_lines.append(f"  Files scanned: {r.files_scanned}")
+                report_lines.append(f"  Findings: {len(r.findings)}")
+                for f in r.findings[:5]:
+                    report_lines.append(f"    - [{f.severity}] {f.message}")
+                    report_lines.append(f"      {f.file_path}:{f.line_number}")
+                if len(r.findings) > 5:
+                    report_lines.append(f"    ... and {len(r.findings) - 5} more")
+                report_lines.append("")
+
+        return ("\n".join(report_lines), total, with_issues)
+
+
+class TensorTrapAnalyzeWorkflow:
+    """Analyzes the current workflow for security issues.
+
+    Checks for dangerous node types, suspicious data flows,
+    URL injection risks, and known CVE patterns.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "hidden": {
+                "prompt": "PROMPT",
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "BOOLEAN", "INT")
+    RETURN_NAMES = ("analysis_report", "is_safe", "findings_count")
+    FUNCTION = "analyze"
+    CATEGORY = "TensorTrap/Security"
+
+    def analyze(self, prompt=None):
+        if prompt is None:
+            return ("No workflow data available", True, 0)
+
+        from analyzer.graph_analyzer import analyze_workflow
+
+        result = analyze_workflow(prompt, source="current_workflow")
+
+        report_lines = [
+            f"TensorTrap Workflow Analysis",
+            f"Nodes: {result.total_nodes} | Connections: {result.total_connections}",
+            f"Status: {'SAFE' if result.is_safe else 'THREATS DETECTED'}\n",
+        ]
+
+        if result.findings:
+            for f in result.findings:
+                report_lines.append(f"[{f.severity}] {f.message}")
+                if f.details.get("cve"):
+                    report_lines.append(f"  CVE: {f.details['cve']}")
+                report_lines.append("")
+
+        return (
+            "\n".join(report_lines),
+            result.is_safe,
+            len(result.findings),
+        )
