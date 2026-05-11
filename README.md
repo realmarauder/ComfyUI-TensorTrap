@@ -44,7 +44,15 @@ Analyzes the current workflow's node graph for:
 - Known dangerous node types (CVE-2024-21576, CVE-2024-21577)
 - Dangerous data flows (string outputs feeding into eval nodes)
 - URL injection risks (external URLs in download nodes)
-- Suspicious input values (code-like patterns in text fields)
+- Pickle-deserializer abuse (CWE-502) — e.g. `Base64ToConditioning` from RES4LYF with a literal payload, or a connection from a source outside the trusted-producer set
+- Base64-encoded pickle payloads smuggled into generic string widgets
+- Sensitive filesystem paths in widget values (`/etc/passwd`, `~/.ssh/id_rsa`, AWS/GitHub credential paths, deep `../` traversal)
+- Suspicious code-shaped strings (`__reduce__`, `__class__.__bases__`, `__builtins__`, `pickle.loads`, `compile()`, etc.)
+
+Set `block_on_threat=True` (the default) and the node raises and stops the queue when it sees a finding at or above `min_severity` (default `HIGH`). Set `block_on_threat=False` to get reports without blocking.
+
+### Preflight Check (TensorTrap)
+One-stop composite node that runs all three audits and blocks on any finding at or above `min_severity`. Wire it once at the top of your workflow and the whole graph is gated. Each section (model scan, node audit, workflow analysis) can be skipped independently. Optionally takes a `model_path` to scan a specific file as part of the check.
 
 ## Installation
 
@@ -65,7 +73,7 @@ pip install tensortrap
 
 ## Usage
 
-All three nodes live under the **TensorTrap/Security** category in ComfyUI's node menu. None of them touch your generation pipeline — they sit alongside it and report.
+All four nodes live under the **TensorTrap/Security** category in ComfyUI's node menu. None of them touch your generation pipeline — they sit alongside it and report (or block).
 
 ### Quick start: three things you can do today
 
@@ -120,9 +128,19 @@ For checkpoints loaded via `CheckpointLoaderSimple` (dropdown selector, not a pa
 | After installing or updating any custom node pack | **Audit Installed Nodes**            |
 | Before running a workflow you didn't author       | **Analyze Workflow**                 |
 | Before loading a model from an unfamiliar source  | **Scan Model** or `tensortrap scan`  |
-| Before publishing a workflow you want to share    | All three                            |
+| Before publishing a workflow you want to share    | All three (or **Preflight Check**)   |
+| Default-on protection for any workflow            | **Preflight Check** at the top       |
 
 Add the audit nodes once and leave them parked in a side group of your graph — they cost nothing when not queued.
+
+### Tying into an existing RES4LYF / T5-offload workflow
+
+If you use RES4LYF's `ConditioningToBase64` / `Base64ToConditioning` nodes (hardened in [PR #263](https://github.com/ClownsharkBatwing/RES4LYF/pull/263)), drop **Analyze Workflow** or **Preflight Check** into the same graph. Both nodes flag two specific RES4LYF-relevant patterns:
+
+- **CRITICAL** — A `Base64ToConditioning` node has a literal non-empty `data` value in the workflow JSON itself. That is the exact CWE-502 attack pattern from [issue #252](https://github.com/ClownsharkBatwing/RES4LYF/issues/252): the payload runs through `pickle.loads()` the moment the workflow executes.
+- **MEDIUM** — A `Base64ToConditioning` node has its `data` input wired to something other than a `ConditioningToBase64` node in the same graph. The flow may be legitimate, but verify it.
+
+The pickle-deserializer registry that powers this check is a growing list — open an issue if you find another ComfyUI node that calls `pickle.loads()` on a workflow-supplied input and we will add it.
 
 ## Contributing
 
