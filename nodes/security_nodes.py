@@ -196,3 +196,161 @@ class TensorTrapAnalyzeWorkflow:
             result.is_safe,
             len(result.findings),
         )
+
+
+class TensorTrapPreflightCheck:
+    """One-stop preflight: scans an optional model path, audits installed nodes, and
+    analyzes the current workflow. Blocks the queue on any finding at or above
+    `min_severity`. Drop one of these in once and the whole workflow is gated.
+
+    Each section can be individually skipped, and the whole node degrades gracefully
+    if `tensortrap` (the CLI package) is missing — the section that requires it
+    simply reports that it was skipped.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "optional": {
+                "model_path": ("STRING", {"default": "", "multiline": False}),
+                "block_on_threat": ("BOOLEAN", {"default": True}),
+                "min_severity": (["CRITICAL", "HIGH", "MEDIUM", "LOW"], {"default": "HIGH"}),
+                "skip_model_scan": ("BOOLEAN", {"default": False}),
+                "skip_node_audit": ("BOOLEAN", {"default": False}),
+                "skip_workflow_analysis": ("BOOLEAN", {"default": False}),
+            },
+            "hidden": {"prompt": "PROMPT"},
+        }
+
+    RETURN_TYPES = ("STRING", "BOOLEAN", "INT")
+    RETURN_NAMES = ("combined_report", "all_safe", "total_findings")
+    FUNCTION = "preflight"
+    CATEGORY = "TensorTrap/Security"
+
+    def preflight(
+        self,
+        model_path: str = "",
+        block_on_threat: bool = True,
+        min_severity: str = "HIGH",
+        skip_model_scan: bool = False,
+        skip_node_audit: bool = False,
+        skip_workflow_analysis: bool = False,
+        prompt: dict | None = None,
+    ):
+        sections: list[str] = ["TensorTrap Preflight Check"]
+        worst_severity_rank = 4   # nothing yet
+        worst_finding_summary: str | None = None
+        total_findings = 0
+        all_safe = True
+
+        threshold = _SEVERITY_ORDER.get(min_severity, 1)
+
+        # --- 1. Model scan (only if a path is provided) ---
+        if not skip_model_scan and model_path.strip():
+            sections.append("\n[1] Model scan")
+            try:
+                from pathlib import Path as _Path
+
+                from tensortrap.scanner.engine import scan_file
+
+                filepath = _Path(model_path).expanduser()
+                if not filepath.exists():
+                    sections.append(f"  Skipped — file not found: {model_path}")
+                else:
+                    result = scan_file(filepath, compute_hash=False)
+                    if result.is_safe:
+                        sections.append(f"  SAFE — {filepath.name}")
+                    else:
+                        all_safe = False
+                        max_sev = result.max_severity.value.upper() if result.max_severity else "UNKNOWN"
+                        sections.append(f"  {max_sev} — {filepath.name}")
+                        for finding in result.findings[:10]:
+                            sev = getattr(finding, "severity", None)
+                            sev_str = sev.value.upper() if hasattr(sev, "value") else str(sev)
+                            sections.append(f"    [{sev_str}] {getattr(finding, 'message', finding)}")
+                            rank = _SEVERITY_ORDER.get(sev_str, 4)
+                            total_findings += 1
+                            if rank < worst_severity_rank:
+                                worst_severity_rank = rank
+                                worst_finding_summary = f"Model scan {sev_str}: {filepath.name}"
+            except ImportError:
+                sections.append("  Skipped — tensortrap CLI not installed (pip install tensortrap)")
+            except Exception as e:
+                sections.append(f"  Error: {e}")
+        elif not skip_model_scan:
+            sections.append("\n[1] Model scan: skipped (no model_path provided)")
+        else:
+            sections.append("\n[1] Model scan: skipped (skip_model_scan=True)")
+
+        # --- 2. Installed-node audit ---
+        if not skip_node_audit:
+            sections.append("\n[2] Installed-node audit")
+            try:
+                from pathlib import Path as _Path
+
+                from auditor.node_scanner import scan_all_nodes
+
+                custom_nodes_dir = _Path(__file__).resolve().parent.parent.parent
+                results = scan_all_nodes(custom_nodes_dir)
+                total = len(results)
+                with_issues = sum(1 for r in results if not r.is_safe)
+                sections.append(f"  {total} packages scanned, {with_issues} flagged")
+                for r in sorted(results, key=lambda x: x.is_safe):
+                    if r.is_safe:
+                        continue
+                    sev = str(getattr(r, "max_severity", "UNKNOWN")).upper()
+                    sections.append(f"    [{sev}] {r.package_name} ({len(r.findings)} findings)")
+                    rank = _SEVERITY_ORDER.get(sev, 4)
+                    total_findings += len(r.findings)
+                    if rank < worst_severity_rank:
+                        worst_severity_rank = rank
+                        worst_finding_summary = f"Node audit {sev}: {r.package_name}"
+                if with_issues > 0:
+                    all_safe = False
+            except ImportError as e:
+                sections.append(f"  Skipped — auditor module unavailable: {e}")
+            except Exception as e:
+                sections.append(f"  Error: {e}")
+        else:
+            sections.append("\n[2] Installed-node audit: skipped (skip_node_audit=True)")
+
+        # --- 3. Workflow analysis ---
+        if not skip_workflow_analysis:
+            sections.append("\n[3] Workflow analysis")
+            if prompt is None:
+                sections.append("  Skipped — no workflow context")
+            else:
+                from analyzer.graph_analyzer import analyze_workflow
+
+                result = analyze_workflow(prompt, source="preflight_check")
+                sections.append(
+                    f"  {result.total_nodes} nodes, {result.total_connections} connections, "
+                    f"{len(result.findings)} findings"
+                )
+                total_findings += len(result.findings)
+                if not result.is_safe:
+                    all_safe = False
+                for f in result.findings:
+                    sections.append(f"    [{f.severity}] {f.node_type}: {f.message}")
+                    rank = _SEVERITY_ORDER.get(f.severity, 4)
+                    if rank < worst_severity_rank:
+                        worst_severity_rank = rank
+                        worst_finding_summary = f"Workflow {f.severity}: {f.node_type} (node {f.node_id})"
+        else:
+            sections.append("\n[3] Workflow analysis: skipped (skip_workflow_analysis=True)")
+
+        sections.append(
+            f"\nResult: {'PASS' if all_safe else 'FAIL'} "
+            f"(total findings: {total_findings})"
+        )
+        report = "\n".join(sections)
+
+        if block_on_threat and worst_severity_rank <= threshold:
+            raise Exception(
+                f"TensorTrap preflight failed: {worst_finding_summary}. "
+                f"Lower min_severity, set block_on_threat=False, or fix the finding before "
+                f"queueing this workflow."
+            )
+
+        return (report, all_safe, total_findings)

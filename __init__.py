@@ -8,6 +8,7 @@
 from .nodes.security_nodes import (
     TensorTrapAnalyzeWorkflow,
     TensorTrapAuditNodes,
+    TensorTrapPreflightCheck,
     TensorTrapScanModel,
 )
 
@@ -15,12 +16,14 @@ NODE_CLASS_MAPPINGS = {
     "TensorTrap_ScanModel": TensorTrapScanModel,
     "TensorTrap_AuditNodes": TensorTrapAuditNodes,
     "TensorTrap_AnalyzeWorkflow": TensorTrapAnalyzeWorkflow,
+    "TensorTrap_PreflightCheck": TensorTrapPreflightCheck,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "TensorTrap_ScanModel": "Scan Model (TensorTrap)",
     "TensorTrap_AuditNodes": "Audit Installed Nodes (TensorTrap)",
     "TensorTrap_AnalyzeWorkflow": "Analyze Workflow (TensorTrap)",
+    "TensorTrap_PreflightCheck": "Preflight Check (TensorTrap)",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
