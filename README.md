@@ -65,10 +65,64 @@ pip install tensortrap
 
 ## Usage
 
-1. **Add nodes** from the "TensorTrap/Security" category in ComfyUI's node menu
-2. **Scan Model** — Connect a file path string to the Scan Model node, then connect its output to your model loader
-3. **Audit Nodes** — Add the Audit node anywhere and run the workflow to get a report of all installed node packages
-4. **Analyze Workflow** — Add the Analyze node to check the current workflow for dangerous patterns
+All three nodes live under the **TensorTrap/Security** category in ComfyUI's node menu. None of them touch your generation pipeline — they sit alongside it and report.
+
+### Quick start: three things you can do today
+
+**1. Audit your installed nodes after every `git pull` or ComfyUI Manager install.**
+
+Build a tiny side workflow: drop **Audit Installed Nodes**, connect its `audit_report` output to any Show Text / Display String node (from pysssss, rgthree, was-node-suite, etc.), and queue it. You'll get a per-package report of dangerous patterns (`eval`, `exec`, `subprocess`, `os.system`, `pickle.loads`, hardcoded URLs, obfuscated payloads). If a pack you trust shows up flagged, file an issue with the maintainer — this is exactly how [RES4LYF #252](https://github.com/ClownsharkBatwing/RES4LYF/issues/252) was filed and fixed.
+
+```
+[Audit Installed Nodes]  →  audit_report          →  [Show Text]
+                            total_packages        →  (optional)
+                            packages_with_issues  →  (optional)
+```
+
+**2. Analyze any workflow you didn't write before you run it.**
+
+When you pull a workflow JSON from Civitai, Discord, or Reddit, open it in ComfyUI, drop in **Analyze Workflow**, and queue. The node reads the active workflow graph and flags:
+
+- Known dangerous node types (CVE-2024-21576, CVE-2024-21577)
+- Suspicious string flows (raw text feeding into eval-like nodes)
+- Embedded URLs in download nodes
+- Code-shaped values pasted into text fields
+
+If anything fires, you see it before the malicious node code actually runs.
+
+```
+[Analyze Workflow]  →  analysis_report  →  [Show Text]
+                       is_safe          →  (optional)
+                       findings_count   →  (optional)
+```
+
+**3. Scan a specific model file before loading it.**
+
+The **Scan Model** node takes a `STRING` path and returns three outputs: the same path (pass-through), a JSON scan report, and an `is_safe` boolean. Wire it like:
+
+```
+[Primitive: STRING "models/checkpoints/foo.safetensors"]
+        │
+        ▼
+[Scan Model]  →  model_path   →  (your path-based loader, e.g. Load Diffusion Model)
+                 scan_report  →  [Show Text]  (optional)
+                 is_safe      →  (Conditional / Switch node, optional)
+```
+
+By default the node raises and stops the queue when it sees HIGH or CRITICAL findings. Lower `min_severity` to `MEDIUM` for paranoid mode; set `block_on_threat=False` if you just want the report without blocking.
+
+For checkpoints loaded via `CheckpointLoaderSimple` (dropdown selector, not a path), skip this node and run the CLI: `tensortrap scan models/checkpoints/foo.safetensors`. Same engine, same findings.
+
+### Recommended audit cadence
+
+| When                                              | Run                                  |
+|---------------------------------------------------|--------------------------------------|
+| After installing or updating any custom node pack | **Audit Installed Nodes**            |
+| Before running a workflow you didn't author       | **Analyze Workflow**                 |
+| Before loading a model from an unfamiliar source  | **Scan Model** or `tensortrap scan`  |
+| Before publishing a workflow you want to share    | All three                            |
+
+Add the audit nodes once and leave them parked in a side group of your graph — they cost nothing when not queued.
 
 ## Contributing
 
