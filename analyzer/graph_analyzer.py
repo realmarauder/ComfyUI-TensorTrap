@@ -9,6 +9,7 @@ for dangerous data flow patterns:
 - Suspicious node combinations
 """
 
+import base64 as _base64
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -104,6 +105,41 @@ STRING_OUTPUT_NODES = {
     "ShowText",
 }
 
+# Filesystem paths whose mere mention in a workflow input is high-signal for an
+# information-disclosure or credential-theft attempt. Matched as substrings, so
+# subpaths under these roots also fire.
+SENSITIVE_PATHS_HIGH = (
+    "/etc/passwd",
+    "/etc/shadow",
+    "/etc/sudoers",
+    "/root/.bash_history",
+    "/root/.ssh/",
+    "/.ssh/id_rsa",
+    "/.ssh/id_ed25519",
+    "/.aws/credentials",
+    "/.config/gh/",
+    "/.netrc",
+    "/proc/self/environ",
+    "/proc/self/maps",
+    r"\Users\Administrator",
+    r"\.ssh\id_rsa",
+    r"\.aws\credentials",
+    r"\AppData\Roaming\Microsoft\Credentials",
+)
+
+# Filesystem paths that are typically untouched by ComfyUI workflows. A mention
+# is suspicious but could be benign in some edge cases.
+SENSITIVE_PATHS_MEDIUM = (
+    "/etc/",
+    "/root/",
+    "/var/log/",
+    "/usr/bin/",
+    "/usr/sbin/",
+    "/dev/",
+    r"\Windows\System32",
+    r"\Windows\SysWOW64",
+)
+
 
 @dataclass
 class GraphFinding:
@@ -184,6 +220,12 @@ def analyze_workflow(workflow: dict, source: str = "inline") -> GraphAnalysisRes
 
     # Check for pickle-deserializer abuse (CWE-502)
     _check_pickle_deserializers(nodes, result)
+
+    # Check for base64-encoded pickle payloads smuggled into string widgets
+    _check_embedded_pickle(nodes, result)
+
+    # Check for sensitive filesystem paths in widget values
+    _check_path_traversal(nodes, result)
 
     # Check for suspicious patterns
     _check_suspicious_patterns(nodes, connections, result)
@@ -461,6 +503,121 @@ def _check_pickle_deserializers(nodes: dict, result: GraphAnalysisResult):
                     )
 
 
+_BASE64_ALPHABET = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+
+
+def _looks_like_base64(value: str, min_len: int = 60) -> bool:
+    """Heuristic: is this string plausibly base64-encoded binary data?"""
+    if len(value) < min_len:
+        return False
+    stripped = value.strip()
+    if not stripped:
+        return False
+    in_alpha = sum(1 for c in stripped if c in _BASE64_ALPHABET)
+    return in_alpha / len(stripped) > 0.95
+
+
+def _decodes_to_pickle(value: str) -> bool:
+    """Does this base64 string decode to bytes that start with a pickle opcode?
+
+    Pickle protocols 2-5 start with \\x80 followed by a protocol byte (0x02-0x05).
+    Protocol 0/1 streams start with one of the legacy opcodes; we conservatively
+    only flag protocol 2+ to keep false-positive rate low.
+    """
+    try:
+        decoded = _base64.b64decode(value, validate=True)
+    except (ValueError, _base64.binascii.Error):
+        return False
+    if len(decoded) < 2:
+        return False
+    return decoded[0] == 0x80 and decoded[1] in (0x02, 0x03, 0x04, 0x05)
+
+
+def _check_embedded_pickle(nodes: dict, result: GraphAnalysisResult):
+    """Flag widget values that look like base64-encoded pickle streams.
+
+    The pickle-deserializer rule already covers the case where such a payload sits
+    in a known deserializer's input field. This rule catches the same payload in
+    *any* node's string input — useful when the payload is staged on a generic
+    string node before being routed to a deserializer.
+    """
+    for node_id, node_data in nodes.items():
+        class_type = node_data.get("class_type", "")
+        inputs = node_data.get("inputs", {})
+
+        for input_name, input_value in inputs.items():
+            if not isinstance(input_value, str):
+                continue
+            if not _looks_like_base64(input_value):
+                continue
+            if not _decodes_to_pickle(input_value):
+                continue
+
+            result.findings.append(
+                GraphFinding(
+                    severity="HIGH",
+                    category="embedded_pickle",
+                    message=(
+                        f"{class_type} input '{input_name}' contains a base64-encoded pickle "
+                        f"stream (length {len(input_value)}). Pickle payloads in workflow widgets "
+                        f"are a CWE-502 attack vector — verify this value is intentional."
+                    ),
+                    node_id=node_id,
+                    node_type=class_type,
+                    details={
+                        "input_name": input_name,
+                        "payload_length": len(input_value),
+                        "value_preview": input_value[:80] + ("..." if len(input_value) > 80 else ""),
+                    },
+                )
+            )
+
+
+def _check_path_traversal(nodes: dict, result: GraphAnalysisResult):
+    """Flag references to sensitive filesystem paths in widget values."""
+    for node_id, node_data in nodes.items():
+        class_type = node_data.get("class_type", "")
+        inputs = node_data.get("inputs", {})
+
+        for input_name, input_value in inputs.items():
+            if not isinstance(input_value, str) or not input_value:
+                continue
+
+            hit = None
+            for path in SENSITIVE_PATHS_HIGH:
+                if path in input_value:
+                    hit = ("HIGH", path)
+                    break
+            if hit is None:
+                for path in SENSITIVE_PATHS_MEDIUM:
+                    if path in input_value:
+                        hit = ("MEDIUM", path)
+                        break
+            if hit is None and input_value.count("../") >= 3:
+                hit = ("MEDIUM", f"{input_value.count('../')} levels of '../' traversal")
+
+            if hit is None:
+                continue
+
+            severity, reason = hit
+            result.findings.append(
+                GraphFinding(
+                    severity=severity,
+                    category="path_traversal",
+                    message=(
+                        f"{class_type} input '{input_name}' references a sensitive path: {reason}. "
+                        f"Value: {input_value[:120]}{'...' if len(input_value) > 120 else ''}"
+                    ),
+                    node_id=node_id,
+                    node_type=class_type,
+                    details={
+                        "input_name": input_name,
+                        "match": reason,
+                    },
+                )
+            )
+
+
 def _check_suspicious_patterns(nodes: dict, connections: dict, result: GraphAnalysisResult):
     """Check for suspicious workflow patterns."""
     node_types = {nid: nd.get("class_type", "") for nid, nd in nodes.items()}
@@ -474,13 +631,23 @@ def _check_suspicious_patterns(nodes: dict, connections: dict, result: GraphAnal
             if not isinstance(input_value, str):
                 continue
 
-            # Check for code-like patterns in string inputs
+            # Check for code-like patterns in string inputs. Narrow + high-confidence
+            # patterns first; broader heuristics last so reports stay readable.
             suspicious_patterns = [
                 ("__import__", "CRITICAL", "Dynamic import in input value"),
                 ("os.system", "CRITICAL", "os.system() in input value"),
                 ("subprocess", "CRITICAL", "subprocess reference in input value"),
                 ("eval(", "CRITICAL", "eval() in input value"),
                 ("exec(", "CRITICAL", "exec() in input value"),
+                ("__reduce__", "CRITICAL", "Pickle __reduce__ override in input value"),
+                ("__class__.__bases__", "CRITICAL", "Python sandbox-escape pattern in input value"),
+                ("__class__.__subclasses__", "CRITICAL", "Python sandbox-escape pattern in input value"),
+                ("__builtins__", "HIGH", "__builtins__ reference in input value"),
+                ("pickle.loads", "HIGH", "Explicit pickle.loads() reference in input value"),
+                ("marshal.loads", "HIGH", "marshal.loads() reference in input value"),
+                ("compile(", "HIGH", "compile() builtin in input value"),
+                ("runpy", "HIGH", "runpy reference in input value"),
+                ("getattr(__builtins__", "CRITICAL", "Pickle gadget pattern in input value"),
                 ("open(", "HIGH", "file open() in input value"),
                 ("socket.", "HIGH", "Socket reference in input value"),
                 (".decode(", "MEDIUM", "Decode call in input value — possible obfuscation"),
