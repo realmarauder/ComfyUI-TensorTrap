@@ -117,17 +117,26 @@ class TensorTrapAuditNodes:
         return ("\n".join(report_lines), total, with_issues)
 
 
+_SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+
+
 class TensorTrapAnalyzeWorkflow:
     """Analyzes the current workflow for security issues.
 
     Checks for dangerous node types, suspicious data flows,
-    URL injection risks, and known CVE patterns.
+    URL injection risks, pickle-deserializer abuse (CWE-502),
+    embedded pickle payloads, sensitive filesystem paths,
+    and known CVE patterns.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {},
+            "optional": {
+                "block_on_threat": ("BOOLEAN", {"default": True}),
+                "min_severity": (["CRITICAL", "HIGH", "MEDIUM", "LOW"], {"default": "HIGH"}),
+            },
             "hidden": {
                 "prompt": "PROMPT",
             },
@@ -138,7 +147,7 @@ class TensorTrapAnalyzeWorkflow:
     FUNCTION = "analyze"
     CATEGORY = "TensorTrap/Security"
 
-    def analyze(self, prompt=None):
+    def analyze(self, prompt=None, block_on_threat=True, min_severity="HIGH"):
         if prompt is None:
             return ("No workflow data available", True, 0)
 
@@ -147,7 +156,7 @@ class TensorTrapAnalyzeWorkflow:
         result = analyze_workflow(prompt, source="current_workflow")
 
         report_lines = [
-            f"TensorTrap Workflow Analysis",
+            "TensorTrap Workflow Analysis",
             f"Nodes: {result.total_nodes} | Connections: {result.total_connections}",
             f"Status: {'SAFE' if result.is_safe else 'THREATS DETECTED'}\n",
         ]
@@ -157,10 +166,33 @@ class TensorTrapAnalyzeWorkflow:
                 report_lines.append(f"[{f.severity}] {f.message}")
                 if f.details.get("cve"):
                     report_lines.append(f"  CVE: {f.details['cve']}")
+                if f.details.get("reference"):
+                    report_lines.append(f"  Reference: {f.details['reference']}")
                 report_lines.append("")
 
+        report_text = "\n".join(report_lines)
+
+        if block_on_threat and result.findings:
+            threshold = _SEVERITY_ORDER.get(min_severity, 1)
+            worst = min(
+                (_SEVERITY_ORDER.get(f.severity, 4) for f in result.findings),
+                default=4,
+            )
+            if worst <= threshold:
+                worst_finding = min(
+                    result.findings,
+                    key=lambda f: _SEVERITY_ORDER.get(f.severity, 4),
+                )
+                raise Exception(
+                    f"TensorTrap blocked workflow: {worst_finding.severity} finding in "
+                    f"{worst_finding.node_type} (node {worst_finding.node_id}): "
+                    f"{worst_finding.message}\n\n"
+                    f"To proceed anyway, set block_on_threat=False on the Analyze Workflow node, "
+                    f"or raise min_severity above {worst_finding.severity}."
+                )
+
         return (
-            "\n".join(report_lines),
+            report_text,
             result.is_safe,
             len(result.findings),
         )
