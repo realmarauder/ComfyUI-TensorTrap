@@ -13,6 +13,25 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# Known nodes that call pickle.loads() (or equivalent deserializers) on a workflow-supplied
+# input. A literal value in the pickle input field of one of these nodes is the exact
+# CWE-502 attack pattern: a shared workflow embeds a base64 payload, and running the
+# workflow triggers arbitrary code execution. A connection from an unknown source is
+# softer-suspicious — verify it came from the matching trusted producer in the same graph.
+#
+# Add new entries here as TensorTrap audits surface more pickle.loads() exposures.
+PICKLE_DESERIALIZER_NODES = {
+    "Base64ToConditioning": {
+        "pack": "RES4LYF",
+        "input_fields": ["data"],          # API-format input names
+        "widget_indices": [0],              # UI-format widgets_values positions
+        "trusted_producers": {"ConditioningToBase64"},
+        "cwe": "CWE-502",
+        "reference": "https://github.com/ClownsharkBatwing/RES4LYF/issues/252",
+        "node_purpose": "deserializes base64-encoded conditioning data via pickle.loads()",
+    },
+}
+
 # Known dangerous node types (from CVE research)
 DANGEROUS_NODES = {
     # Direct code execution (CVE-2024-21576, CVE-2024-21577)
@@ -163,6 +182,9 @@ def analyze_workflow(workflow: dict, source: str = "inline") -> GraphAnalysisRes
     # Check for URL injection risks
     _check_url_inputs(nodes, result)
 
+    # Check for pickle-deserializer abuse (CWE-502)
+    _check_pickle_deserializers(nodes, result)
+
     # Check for suspicious patterns
     _check_suspicious_patterns(nodes, connections, result)
 
@@ -199,11 +221,8 @@ def analyze_workflow_file(filepath: Path) -> GraphAnalysisResult:
 
 def _extract_nodes(workflow: dict) -> dict:
     """Extract nodes from either API format or UI format workflow."""
-    # API format: {"1": {"class_type": "...", "inputs": {...}}, "2": {...}}
-    if all(isinstance(v, dict) and "class_type" in v for v in workflow.values() if isinstance(v, dict)):
-        return workflow
-
-    # UI format: {"nodes": [...], "links": [...]}
+    # UI format: {"nodes": [...], "links": [...]} — check first; the API-format check
+    # below would otherwise vacuously match if we left a "nodes" list key in place.
     if "nodes" in workflow and isinstance(workflow["nodes"], list):
         # Convert to API-like format
         nodes = {}
@@ -220,6 +239,11 @@ def _extract_nodes(workflow: dict) -> dict:
     # Might be wrapped in "prompt" key
     if "prompt" in workflow and isinstance(workflow["prompt"], dict):
         return _extract_nodes(workflow["prompt"])
+
+    # API format: {"1": {"class_type": "...", "inputs": {...}}, "2": {...}}.
+    # Require at least one entry and every value to be a class_type dict.
+    if workflow and all(isinstance(v, dict) and "class_type" in v for v in workflow.values()):
+        return workflow
 
     return {}
 
@@ -359,6 +383,82 @@ def _check_url_inputs(nodes: dict, result: GraphAnalysisResult):
                         },
                     )
                 )
+
+
+def _check_pickle_deserializers(nodes: dict, result: GraphAnalysisResult):
+    """Flag nodes that call pickle.loads() (or equivalent) on workflow-supplied input.
+
+    Two patterns trigger findings:
+      CRITICAL — the pickle input field holds a literal non-empty string. That is an
+                 active CWE-502 payload embedded in the workflow JSON itself.
+      MEDIUM   — the pickle input is connected to a node not on the trusted-producers
+                 list. The flow may be legitimate but warrants review.
+    """
+    for node_id, node_data in nodes.items():
+        class_type = node_data.get("class_type", "")
+        if class_type not in PICKLE_DESERIALIZER_NODES:
+            continue
+
+        info = PICKLE_DESERIALIZER_NODES[class_type]
+        inputs = node_data.get("inputs", {})
+
+        candidates: list[tuple[str, object]] = []
+        for fname in info.get("input_fields", []):
+            if fname in inputs:
+                candidates.append((fname, inputs[fname]))
+        for idx in info.get("widget_indices", []):
+            key = f"widget_{idx}"
+            if key in inputs:
+                candidates.append((key, inputs[key]))
+
+        for field_name, value in candidates:
+            if isinstance(value, str) and value.strip():
+                result.findings.append(
+                    GraphFinding(
+                        severity="CRITICAL",
+                        category="pickle_deserialization",
+                        message=(
+                            f"{class_type} ({info['pack']}) {info['node_purpose']}. "
+                            f"Its '{field_name}' input holds a literal payload of length {len(value)}. "
+                            f"This is the {info['cwe']} attack pattern — running this workflow may "
+                            f"execute arbitrary code. See {info['reference']}."
+                        ),
+                        node_id=node_id,
+                        node_type=class_type,
+                        details={
+                            "cwe": info["cwe"],
+                            "reference": info["reference"],
+                            "pack": info["pack"],
+                            "input_field": field_name,
+                            "payload_length": len(value),
+                        },
+                    )
+                )
+            elif isinstance(value, list) and len(value) == 2:
+                source_id = str(value[0])
+                source_type = nodes.get(source_id, {}).get("class_type", "")
+                if source_type and source_type not in info["trusted_producers"]:
+                    result.findings.append(
+                        GraphFinding(
+                            severity="MEDIUM",
+                            category="pickle_deserialization",
+                            message=(
+                                f"{class_type}'s '{field_name}' input is connected to "
+                                f"{source_type} (node {source_id}). Trusted producers are "
+                                f"{sorted(info['trusted_producers'])}. Verify this flow."
+                            ),
+                            node_id=node_id,
+                            node_type=class_type,
+                            details={
+                                "cwe": info["cwe"],
+                                "reference": info["reference"],
+                                "input_field": field_name,
+                                "source_node": source_id,
+                                "source_type": source_type,
+                                "trusted_producers": sorted(info["trusted_producers"]),
+                            },
+                        )
+                    )
 
 
 def _check_suspicious_patterns(nodes: dict, connections: dict, result: GraphAnalysisResult):
