@@ -157,7 +157,7 @@ This project builds on active security research into AI workflow execution attac
 
 - [CivitAI](https://civitai.com) | [Hugging Face](https://huggingface.co) | [ComfyUI](https://github.com/comfyanonymous/ComfyUI) | [Replicate](https://replicate.com) | [RunPod](https://www.runpod.io) | [Stability AI](https://stability.ai) | [Vast.ai](https://vast.ai) | [Digital Ocean](https://www.digitalocean.com)
 
-Contact: smichael.us@gmail.com | [M2 Dynamics](https://m2dynamics.us)
+Contact: smichael@m2dynamics.us | [M2 Dynamics](https://m2dynamics.us)
 
 ## License
 
